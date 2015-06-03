@@ -49,6 +49,7 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
     last_read : float option;
     stats : stats;
     reader : (module Pcap.HDR);
+    header : Cstruct.t ;
     written : Cstruct.t list ref;
   }
 
@@ -75,8 +76,7 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
   let connect (i : id) =
     let open Lwt in
     K.read i.source i.file 0 (Pcap.sizeof_pcap_header) >>=
-    fun result ->
-    match result with
+    function
     | `Error _ -> Lwt.return (`Error (`Unknown "file could not be read") )
     | `Ok bufs ->
       match bufs with
@@ -91,6 +91,7 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
               seek = Pcap.sizeof_pcap_header;
               last_read = None;
               stats = empty_stats_counter;
+              header = hd ;
               reader;
               written = ref [];
             })
@@ -123,6 +124,15 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
 
   let rec listen t cb =
     let open Lwt in
+    let module R = (val t.reader : Pcap.HDR) in
+    let stuff x = match R.get_pcap_header_network t.header with
+      | 1l -> x
+      | 0l -> match Cstruct.LE.get_uint32 x 0 with
+        | 2l ->
+          let hdr = Cstruct.create 14 in
+          Cstruct.BE.set_uint16 hdr 12 0x800 ;
+          combine_cstructs [hdr ; Cstruct.shift x 4]
+    in
     let read_wrapper (i : id) seek how_many =
       K.read i.source i.file seek how_many >>= function
       | `Ok [] -> Lwt.return None
@@ -137,7 +147,6 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
       | Some packet_header ->
         let t = advance_seek t Pcap.sizeof_pcap_packet in
         (* try to read packet body *)
-        let module R = (val t.reader : Pcap.HDR) in
         let packet_size = Int32.to_int (R.get_pcap_packet_incl_len
                                           packet_header) in
         let packet_secs = R.get_pcap_packet_ts_sec packet_header in
@@ -162,7 +171,8 @@ module Make (K: V1_LWT.KV_RO) (T: V1_LWT.TIME) = struct
         | None -> Lwt.return None
         | Some packet_body ->
           let t = advance_seek t (packet_size) in
-          return (Some (t, delay, packet_body))
+          let packet = stuff packet_body in
+          return (Some (t, delay, packet))
     in
     next_packet t >>= function
     | None -> Lwt.return_unit
